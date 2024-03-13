@@ -17,11 +17,6 @@ export interface SerializedRequest {
   body: string
 }
 
-interface RevivedRequest extends Omit<SerializedRequest, 'url' | 'headers'> {
-  url: URL
-  headers: Headers
-}
-
 export interface SerializedResponse {
   status: number
   statusText: string
@@ -50,22 +45,16 @@ export class RemoteHttpInterceptor extends BatchInterceptor<
     this.on('request', async ({ request, requestId }) => {
       // Send the stringified intercepted request to
       // the parent process where the remote resolver is established.
-      const serializedRequest = JSON.stringify({
-        id: requestId,
-        method: request.method,
-        url: request.url,
-        headers: Array.from(request.headers.entries()),
-        credentials: request.credentials,
-        body: ['GET', 'HEAD'].includes(request.method)
-          ? null
-          : await request.text(),
-      } as SerializedRequest)
+      const serializedRequest = await serialiseRequest(request, requestId)
 
       this.logger.info(
         'sent serialized request to the child:',
         serializedRequest
       )
-      process.send?.(`request:${serializedRequest}`)
+      process.send?.({
+        type: 'request',
+        payload: serializedRequest,
+      })
 
       const responsePromise = new Promise<void>((resolve) => {
         this.requestId2Response.set(requestId, { request, resolve })
@@ -73,35 +62,19 @@ export class RemoteHttpInterceptor extends BatchInterceptor<
       return responsePromise
     })
 
-    const handleParentMessage: NodeJS.MessageListener = (message) => {
-      if (typeof message !== 'string') {
+    const handleParentMessage: NodeJS.MessageListener = (message: any) => {
+      if (message?.type !== 'response') {
         return
       }
-      const startIdPosition = 'response:'.length;
-      const endIdPosition = message.indexOf(':', startIdPosition);
-      const requestId = message.slice(startIdPosition, endIdPosition)
+      const requestId = message.requestId;
       const entry = this.requestId2Response.get(requestId)
       if (!entry) {
         return;
       }
       this.requestId2Response.delete(requestId)
       const { request, resolve } = entry
-      const serializedResponse = message.slice(endIdPosition + 1)
-      console.log(serializedResponse)
 
-      if (!serializedResponse) {
-        return resolve()
-      }
-
-      const responseInit = JSON.parse(
-        serializedResponse
-      ) as SerializedResponse
-
-      const mockedResponse = new Response(responseInit.body, {
-        status: responseInit.status,
-        statusText: responseInit.statusText,
-        headers: responseInit.headers,
-      })
+      const mockedResponse = parseResponse(message.payload)
 
       request.respondWith(mockedResponse)
       return resolve()
@@ -120,17 +93,44 @@ export class RemoteHttpInterceptor extends BatchInterceptor<
   }
 }
 
-export function requestReviver(key: string, value: any) {
-  switch (key) {
-    case 'url':
-      return new URL(value)
+async function serialiseRequest(request: Request, requestId: string): Promise<SerializedRequest> {
+  return {
+    id: requestId,
+    method: request.method,
+    url: request.url,
+    headers: Array.from(request.headers.entries()),
+    credentials: request.credentials,
+    body: ['GET', 'HEAD'].includes(request.method)
+      ? null
+      : await request.text(),
+  } as SerializedRequest
+}
 
-    case 'headers':
-      return new Headers(value)
+function parseRequest(requestInit: SerializedRequest): Request {
+  return new Request(new URL(requestInit.url), {
+    method: requestInit.method,
+    headers: new Headers(requestInit.headers),
+    credentials: requestInit.credentials,
+    body: requestInit.body,
+  })
+}
 
-    default:
-      return value
+async function serialiseResponse(response: Response): Promise<SerializedResponse> {
+  const responseText = await response.text()
+  return {
+    status: response.status,
+    statusText: response.statusText,
+    headers: Array.from(response.headers.entries()),
+    body: responseText,
   }
+}
+
+function parseResponse(responseInit: SerializedResponse): Response {
+  return new Response(responseInit.body, {
+    status: responseInit.status,
+    statusText: responseInit.statusText,
+    headers: responseInit.headers,
+  })
 }
 
 export interface RemoveResolverOptions {
@@ -149,31 +149,18 @@ export class RemoteHttpResolver extends Interceptor<HttpRequestEventMap> {
   protected setup() {
     const logger = this.logger.extend('setup')
 
-    const handleChildMessage: NodeJS.MessageListener = async (message) => {
+    const handleChildMessage: NodeJS.MessageListener = async (message: any) => {
       logger.info('received message from child!', message)
 
-      if (typeof message !== 'string' || !message.startsWith('request:')) {
+      if (message?.type !== 'request') {
         logger.info('unknown message, ignoring...')
         return
       }
 
-      const [, serializedRequest] = message.match(/^request:(.+)$/) || []
-      if (!serializedRequest) {
-        return
-      }
-
-      const requestJson = JSON.parse(
-        serializedRequest,
-        requestReviver
-      ) as RevivedRequest
+      const requestJson = message.payload
       logger.info('parsed intercepted request', requestJson)
 
-      const capturedRequest = new Request(requestJson.url, {
-        method: requestJson.method,
-        headers: new Headers(requestJson.headers),
-        credentials: requestJson.credentials,
-        body: requestJson.body,
-      })
+      const capturedRequest = parseRequest(requestJson)
 
       const { interactiveRequest, requestController } =
         toInteractiveRequest(capturedRequest)
@@ -197,18 +184,13 @@ export class RemoteHttpResolver extends Interceptor<HttpRequestEventMap> {
 
       logger.info('event.respondWith called with:', mockedResponse)
       const responseClone = mockedResponse.clone()
-      const responseText = await mockedResponse.text()
-
-      // Send the mocked response to the child process.
-      const serializedResponse = JSON.stringify({
-        status: mockedResponse.status,
-        statusText: mockedResponse.statusText,
-        headers: Array.from(mockedResponse.headers.entries()),
-        body: responseText,
-      } as SerializedResponse)
-
+      const responsePayload = {
+        type: 'response',
+        requestId: requestJson.id,
+        payload: await serialiseResponse(responseClone),
+      };
       this.process.send(
-        `response:${requestJson.id}:${serializedResponse}`,
+        responsePayload,
         (error) => {
           if (error) {
             return
@@ -227,7 +209,7 @@ export class RemoteHttpResolver extends Interceptor<HttpRequestEventMap> {
 
       logger.info(
         'sent serialized mocked response to the parent:',
-        serializedResponse
+        responsePayload
       )
     }
 
