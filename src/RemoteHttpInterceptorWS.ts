@@ -8,12 +8,14 @@ import { InteractiveRequest, toInteractiveRequest } from './utils/toInteractiveR
 import { emitAsync } from './utils/emitAsync'
 import { FetchInterceptor } from './interceptors/fetch'
 import { parseRequest, parseResponse, serialiseRequest, serialiseResponse } from './remoteUtils';
+import WebSocket, { WebSocketServer } from 'ws';
 
-export class RemoteHttpInterceptor extends BatchInterceptor<
+export class RemoteHttpInterceptorOverWS extends BatchInterceptor<
   [ClientRequestInterceptor, XMLHttpRequestInterceptor, FetchInterceptor]
 > {
   requestId2Response: Map<string, { request: InteractiveRequest, resolve: () => void }> = new Map();
-  constructor() {
+  private _ws: WebSocket | undefined;
+  constructor(private readonly options: { port: number }) {
     super({
       name: 'remote-interceptor',
       interceptors: [
@@ -27,7 +29,9 @@ export class RemoteHttpInterceptor extends BatchInterceptor<
   protected setup() {
     super.setup()
 
-    this.on('request', async ({ request, requestId }) => {
+    this._ws = new WebSocket(`ws://localhost:${this.options.port}`)
+
+    this.prependListener('request', async ({ request, requestId }) => {
       // Send the stringified intercepted request to
       // the parent process where the remote resolver is established.
       const serializedRequest = await serialiseRequest(request, requestId)
@@ -36,21 +40,25 @@ export class RemoteHttpInterceptor extends BatchInterceptor<
         'sent serialized request to the child:',
         serializedRequest
       )
-      process.send?.({
+      this._ws!.send?.(JSON.stringify({
         type: 'request',
         payload: serializedRequest,
-      })
+        requestId,
+      }))
 
       const responsePromise = new Promise<void>((resolve) => {
         this.requestId2Response.set(requestId, { request, resolve })
       })
-      return responsePromise
+      console.log('waiting for response', requestId)
+      await responsePromise
+      console.log('got response', requestId)
     })
 
-    const handleParentMessage: NodeJS.MessageListener = (message: any) => {
-      if (message?.type !== 'response') {
+    const handleParentMessage = (messageRaw: WebSocket.MessageEvent) => {
+      if (typeof messageRaw.data !== 'string') {
         return
       }
+      const message = JSON.parse(messageRaw.data)
       const requestId = message.requestId;
       const entry = this.requestId2Response.get(requestId)
       if (!entry) {
@@ -65,60 +73,54 @@ export class RemoteHttpInterceptor extends BatchInterceptor<
       return resolve()
     }
 
-      // Listen for the mocked response message from the parent.
-      this.logger.info(
-        'add "message" listener to the parent process',
-        handleParentMessage
-      )
-      process.addListener('message', handleParentMessage)
+    // Listen for the mocked response message from the parent.
+    this.logger.info(
+      'add "message" listener to the parent process',
+      handleParentMessage
+    )
+    this._ws.addEventListener('message', handleParentMessage)
 
     this.subscriptions.push(() => {
       process.removeListener('message', handleParentMessage)
     })
   }
+  public dispose(): void {
+    super.dispose()
+    this._ws?.close()
+  }
 }
 
-export interface RemoveResolverOptions {
-  process: ChildProcess
-}
-
-export class RemoteHttpResolver extends Interceptor<HttpRequestEventMap> {
+export class RemoteHttpResolverOverWS extends Interceptor<HttpRequestEventMap> {
   static symbol = Symbol('remote-resolver')
-  private process: ChildProcess
+  private _wss: WebSocketServer | undefined
 
-  constructor(options: RemoveResolverOptions) {
-    super(RemoteHttpResolver.symbol)
-    this.process = options.process
+  constructor(private readonly options: { port: number }) {
+    super(RemoteHttpResolverOverWS.symbol)
   }
 
   protected setup() {
     const logger = this.logger.extend('setup')
 
-    const handleChildMessage: NodeJS.MessageListener = async (message: any) => {
-      logger.info('received message from child!', message)
+    this._wss = new WebSocketServer({ port: this.options.port })
 
-      if (message?.type !== 'request') {
-        logger.info('unknown message, ignoring...')
+    const handleOnMessage = async (ws: WebSocket, data: WebSocket.RawData, isBinary: boolean) => {
+      if (isBinary) {
         return
       }
+      const rawMessage = data.toString()
+      logger.info('received message from child!', rawMessage)
+      const { requestId, payload } = JSON.parse(rawMessage)
 
-      const requestJson = message.payload
-      logger.info('parsed intercepted request', requestJson)
-
-      const capturedRequest = parseRequest(requestJson)
+      const capturedRequest = parseRequest(payload)
 
       const { interactiveRequest, requestController } =
         toInteractiveRequest(capturedRequest)
 
-      this.emitter.once('request', () => {
-        if (requestController.responsePromise.state === 'pending') {
-          requestController.respondWith(undefined)
-        }
-      })
+      console.log('emitting request event', requestId)
 
       await emitAsync(this.emitter, 'request', {
         request: interactiveRequest,
-        requestId: requestJson.id,
+        requestId: requestId,
       })
 
       const mockedResponse = await requestController.responsePromise
@@ -128,14 +130,15 @@ export class RemoteHttpResolver extends Interceptor<HttpRequestEventMap> {
       }
 
       logger.info('event.respondWith called with:', mockedResponse)
+      console.log('calling respondWith', requestId)
       const responseClone = mockedResponse.clone()
       const responsePayload = {
         type: 'response',
-        requestId: requestJson.id,
+        requestId: requestId,
         payload: await serialiseResponse(responseClone),
       };
-      this.process.send(
-        responsePayload,
+      ws.send(
+        JSON.stringify(responsePayload),
         (error) => {
           if (error) {
             return
@@ -147,7 +150,7 @@ export class RemoteHttpResolver extends Interceptor<HttpRequestEventMap> {
             response: responseClone,
             isMockedResponse: true,
             request: capturedRequest,
-            requestId: requestJson.id,
+            requestId: requestId,
           })
         }
       )
@@ -158,15 +161,22 @@ export class RemoteHttpResolver extends Interceptor<HttpRequestEventMap> {
       )
     }
 
+    const handleConnection = (ws: WebSocket) => ws.on('message', (data, isBinary) => handleOnMessage(ws, data, isBinary))
+
     this.subscriptions.push(() => {
-      this.process.removeListener('message', handleChildMessage)
+      this._wss!.removeListener('connection', handleConnection);
       logger.info('removed the "message" listener from the child process!')
     })
 
     logger.info('adding a "message" listener to the child process')
-    this.process.addListener('message', handleChildMessage)
+    this._wss.on('connection', handleConnection);
 
-    this.process.once('error', () => this.dispose())
-    this.process.once('exit', () => this.dispose())
+    this._wss.once('close', () => this.dispose())
+    this._wss.once('error', () => this.dispose())
+  }
+  
+  public dispose(): void {
+    super.dispose()
+    this._wss?.close()
   }
 }

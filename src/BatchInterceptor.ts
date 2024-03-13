@@ -61,6 +61,19 @@ export class BatchInterceptor<
     return this
   }
 
+  public prependListener<EventName extends ExtractEventNames<Events>>(
+    event: EventName,
+    listener: Listener<Events[EventName]>
+  ): this {
+    // Instead of adding a listener to the batch interceptor,
+    // propagate the listener to each of the individual interceptors.
+    for (const interceptor of this.interceptors) {
+      interceptor.prependListener(event, listener)
+    }
+
+    return this
+  }
+
   public once<EventName extends ExtractEventNames<Events>>(
     event: EventName,
     listener: Listener<Events[EventName]>

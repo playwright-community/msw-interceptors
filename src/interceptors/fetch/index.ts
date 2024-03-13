@@ -8,8 +8,10 @@ import { toInteractiveRequest } from '../../utils/toInteractiveRequest'
 import { emitAsync } from '../../utils/emitAsync'
 import { isPropertyAccessible } from '../../utils/isPropertyAccessible'
 import { canParseUrl } from '../../utils/canParseUrl'
+import { RequestController } from '../../utils/RequestController'
 
 export class FetchInterceptor extends Interceptor<HttpRequestEventMap> {
+  private requestId2Controller = new Map<string, RequestController>()
   static symbol = Symbol('fetch')
 
   constructor() {
@@ -30,6 +32,18 @@ export class FetchInterceptor extends Interceptor<HttpRequestEventMap> {
       !(pureFetch as any)[IS_PATCHED_MODULE],
       'Failed to patch the "fetch" module: already patched.'
     )
+
+    this.emitter.on('request', ({ requestId }) => {
+      const controller = this.requestId2Controller.get(requestId)
+      if (!controller) {
+        return
+      }
+      this.requestId2Controller.delete(requestId)
+
+      if (controller.responsePromise.state === 'pending') {
+        controller.responsePromise.resolve(undefined)
+      }
+    })
 
     globalThis.fetch = async (input, init) => {
       const requestId = uuidv4()
@@ -54,20 +68,14 @@ export class FetchInterceptor extends Interceptor<HttpRequestEventMap> {
       const { interactiveRequest, requestController } =
         toInteractiveRequest(request)
 
+      this.requestId2Controller.set(requestId, requestController)
+
       this.logger.info(
         'emitting the "request" event for %d listener(s)...',
         this.emitter.listenerCount('request')
       )
+      // TODO: leak?!
 
-      this.emitter.once('request', ({ requestId: pendingRequestId }) => {
-        if (pendingRequestId !== requestId) {
-          return
-        }
-
-        if (requestController.responsePromise.state === 'pending') {
-          requestController.responsePromise.resolve(undefined)
-        }
-      })
 
       this.logger.info('awaiting for the mocked response...')
 

@@ -62,6 +62,13 @@
       "import": "./lib/node/RemoteHttpInterceptor.mjs",
       "default": "./lib/node/RemoteHttpInterceptor.js"
     },
+    "./RemoteHttpInterceptorWS": {
+      "browser": null,
+      "types": "./lib/node/RemoteHttpInterceptorWS.d.ts",
+      "require": "./lib/node/RemoteHttpInterceptorWS.js",
+      "import": "./lib/node/RemoteHttpInterceptorWS.mjs",
+      "default": "./lib/node/RemoteHttpInterceptorWS.js"
+    },
     "./presets/node": {
       "browser": null,
       "types": "./lib/node/presets/node.d.ts",

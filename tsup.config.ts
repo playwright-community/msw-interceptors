@@ -5,6 +5,7 @@ const nodeConfig: Options = {
     './src/index.ts',
     './src/presets/node.ts',
     './src/RemoteHttpInterceptor.ts',
+    './src/RemoteHttpInterceptorWS.ts',
     './src/interceptors/ClientRequest/index.ts',
     './src/interceptors/XMLHttpRequest/index.ts',
     './src/interceptors/fetch/index.ts',
