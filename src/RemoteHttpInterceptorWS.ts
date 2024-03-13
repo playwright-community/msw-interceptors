@@ -98,6 +98,15 @@ export class RemoteHttpResolverOverWS extends Interceptor<HttpRequestEventMap> {
     super(RemoteHttpResolverOverWS.symbol)
   }
 
+  public port(): number {
+    if (!this._wss)
+      throw new Error('The resolver is not set up yet')
+    const address = this._wss.address();
+    if (typeof address !== "object")
+      throw new Error('pipe/socket address is not supported')
+    return address.port
+  }
+
   protected setup() {
     const logger = this.logger.extend('setup')
 
@@ -174,7 +183,7 @@ export class RemoteHttpResolverOverWS extends Interceptor<HttpRequestEventMap> {
     this._wss.once('close', () => this.dispose())
     this._wss.once('error', () => this.dispose())
   }
-  
+
   public dispose(): void {
     super.dispose()
     this._wss?.close()
