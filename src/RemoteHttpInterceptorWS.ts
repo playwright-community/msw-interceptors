@@ -32,6 +32,10 @@ export class RemoteHttpInterceptorOverWS extends BatchInterceptor<
     this._ws = new WebSocket(`ws://localhost:${this.options.port}`)
 
     this.prependListener('request', async ({ request, requestId }) => {
+      // ignore localhost requests (for Nuxt.js dev server, etc.)
+      if (request.url.includes('localhost')) {
+        return
+      }
       // Send the stringified intercepted request to
       // the parent process where the remote resolver is established.
       const serializedRequest = await serialiseRequest(request, requestId)
